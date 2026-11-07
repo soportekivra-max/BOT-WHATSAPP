@@ -1,0 +1,12 @@
+{
+  "groupJid": "",
+  "intervalMinutes": 60,
+  "scheduledMessage": "📢 Aviso del grupo: mantengamos el orden y respetemos las reglas.",
+  "blockedWords": ["spamword1", "spamword2"],
+  "blockLinks": true,
+  "maxMessagesPerWindow": 6,
+  "windowSeconds": 10,
+  "warningsBeforeKick": 1,
+  "adminNumbers": [],
+  "enabled": true
+}
