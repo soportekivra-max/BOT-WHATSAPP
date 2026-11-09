@@ -372,7 +372,37 @@ app.get('/', async (req, res) => {
   <p><small>Después agrega el número nuevo a tus grupos y hazlo administrador.</small></p>
   <form method="post" action="/reset-session" onsubmit="return confirm('¿Desvincular este número y conectar otro?')"><button style="background:#ffb84d">Desvincular y conectar otro número</button></form></section>`;
   res.send(`<!doctype html><html lang="es"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AD WhatsApp Bot</title>
-  <style>body{font:16px Arial;background:#09090b;color:#eee;max-width:850px;margin:25px auto;padding:0 16px}h1{color:#2bff88}section{background:#171719;padding:18px;border-radius:14px;margin:14px 0}input,textarea,select{box-sizing:border-box;width:100%;padding:12px;margin:7px 0 14px;background:#222;color:#fff;border:1px solid #555;border-radius:8px}button{background:#2bff88;border:0;padding:12px 18px;border-radius:8px;font-weight:bold}button:disabled{opacity:.5;cursor:not-allowed}small{color:#bbb}.log{white-space:pre-wrap;font-size:13px}.grps{margin:8px 0 16px}.grp{display:flex;align-items:center;gap:10px;padding:10px;border-bottom:1px solid #2a2a2e}.grp input{width:22px;height:22px;margin:0}</style>
+  <style>
+  :root{color-scheme:dark;--bg:#080808;--panel:#111111;--gold:#E3B04B;--gold-light:#F5D58A;--text:#F5F1E8;--muted:#AAA39A;--line:rgba(227,176,75,.22);}
+  *{box-sizing:border-box}
+  html{min-height:100%;background:var(--bg)}
+  body{font:15px/1.6 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;background:radial-gradient(ellipse at 50% -18%,rgba(227,176,75,.14),transparent 48%),radial-gradient(ellipse at 100% 40%,rgba(227,176,75,.045),transparent 35%),var(--bg);color:var(--text);max-width:980px;margin:0 auto;padding:34px 20px 60px;}
+  h1{color:var(--gold-light);font-size:clamp(25px,4vw,36px);font-weight:800;letter-spacing:.045em;margin:0 0 8px;padding:8px 0 15px;text-shadow:0 0 24px rgba(227,176,75,.2);}
+  h2{font-size:18px;line-height:1.35;color:var(--gold-light);font-weight:750;margin:0 0 15px;}
+  body>p{color:var(--muted);margin:6px 0 16px;}
+  section{position:relative;background:linear-gradient(145deg,rgba(25,25,25,.98),rgba(13,13,13,.98));border:1px solid var(--line);padding:22px;border-radius:18px;margin:16px 0;box-shadow:0 12px 35px rgba(0,0,0,.28),inset 0 1px 0 rgba(255,255,255,.025);}
+  section>p{color:#C8C0B4}
+  label{display:block;color:#E8DDC8;font-size:13px;font-weight:650;margin:12px 0 5px;}
+  input,textarea,select{box-sizing:border-box;width:100%;padding:12px 14px;margin:7px 0 14px;background:#090909;color:var(--text);border:1px solid #39332A;border-radius:11px;font:inherit;outline:none;transition:border-color .2s,box-shadow .2s,background .2s;}
+  input:focus,textarea:focus,select:focus{border-color:var(--gold);box-shadow:0 0 0 3px rgba(227,176,75,.12);background:#0D0C0A;}
+  input[type=checkbox]{accent-color:var(--gold)}
+  input[type=file]{padding:10px;color:var(--muted)}
+  textarea{resize:vertical;min-height:90px}
+  button{background:linear-gradient(135deg,var(--gold-light),var(--gold) 65%,#C58A2B);color:#171109;border:1px solid rgba(255,230,170,.5);padding:12px 19px;border-radius:11px;font-family:inherit;font-size:13px;font-weight:750;line-height:1.2;letter-spacing:.025em;cursor:pointer;box-shadow:0 5px 18px rgba(227,176,75,.13);transition:transform .18s,filter .18s,box-shadow .18s;}
+  button:hover:not(:disabled){filter:brightness(1.08);transform:translateY(-1px);box-shadow:0 8px 22px rgba(227,176,75,.2);}
+  button:active:not(:disabled){transform:translateY(0)}
+  button:disabled{opacity:.42;cursor:not-allowed;box-shadow:none}
+  form{margin:0}
+  small{color:var(--muted)}
+  .log{white-space:pre-wrap;font-size:12px;line-height:1.7;color:#D6CDBE;background:#090909;border:1px solid #30291F;border-radius:12px;padding:14px;max-height:280px;overflow:auto;}
+  .grps{margin:8px 0 16px;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;}
+  .grp{display:flex;align-items:center;gap:10px;padding:11px 13px;background:rgba(255,255,255,.025);border:1px solid rgba(227,176,75,.13);border-radius:10px;color:#E8E0D2;min-width:0;overflow-wrap:anywhere;}
+  .grp input{flex:0 0 18px;width:18px;height:18px;margin:0;}
+  strong{color:var(--gold-light)}
+  p[role=status]{padding:10px 12px;background:rgba(227,176,75,.07);border:1px solid var(--line);border-radius:10px;}
+  @media(max-width:600px){body{padding:22px 13px 40px;font-size:14px;}h1{font-size:25px}section{padding:17px;border-radius:15px;margin:12px 0;}h2{font-size:17px}button{max-width:100%}.grps{grid-template-columns:1fr}}
+</style>
+
   <h1>ABSOLUTE DATA · WhatsApp Bot</h1><p>Estado: <b>${esc(connection)}</b></p>${errorPanel}${reconnectPanel}<section><h2>Conectar número</h2>${qr}</section>${pairingPanel}
   <form method="post" action="/save"><section><h2>Grupos administrados (${config.groupJids.length})</h2><p><small>Marca los grupos donde el bot enviará avisos y moderará. Si un grupo no aparece, conecta WhatsApp y actualiza la página.</small></p><div class="grps">${groups}</div>
   <label>Intervalo de mensajes (minutos)</label><input name="intervalMinutes" type="number" min="1" value="${config.intervalMinutes}">
