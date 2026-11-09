@@ -1,5 +1,5 @@
 {
-  "groupJid": "",
+  "groupJids": [],
   "intervalMinutes": 60,
   "scheduledMessage": "📢 Aviso del grupo: mantengamos el orden y respetemos las reglas.",
   "blockedWords": ["spamword1", "spamword2"],
