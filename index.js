@@ -225,8 +225,12 @@ async function connect({ manual = false } = {}) {
     });
     socket.ev.on('groups.update', () => refreshGroups());
     socket.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (sock !== socket || type !== 'notify') return;
-      for (const m of messages) { await moderate(m); await handleCommands(m); }
+      if (sock !== socket) return;
+      for (const m of messages) {
+        // 'append' = mensajes enviados desde el mismo teléfono del bot: solo se usan para comandos
+        if (type === 'notify') await moderate(m);
+        if (type === 'notify' || m.key.fromMe) await handleCommands(m);
+      }
     });
   } catch (e) {
     if (socket && sock === socket) sock = null;
@@ -256,7 +260,7 @@ async function moderate(m) {
   if (!jid || !jid.endsWith('@g.us') || m.key.fromMe || !config.enabled || !isManagedGroup(jid)) return;
   const sender = m.key.participant || '';
   if (!sender || isAdmin(sender)) return;
-  const text = (m.message?.conversation || m.message?.extendedTextMessage?.text || '').toLowerCase();
+  const text = getText(m).toLowerCase();
   const hasLink = /(https?:\/\/|www\.|chat\.whatsapp\.com\/)/i.test(text);
   const blocked = config.blockedWords.some(w => w && text.includes(w.toLowerCase()));
   const now = Date.now();
@@ -280,18 +284,33 @@ async function moderate(m) {
     }
   } catch (e) { log('Error de moderación. Verifica que el bot sea administrador: ' + e.message); }
 }
+// Saca el texto aunque venga envuelto (mensajes temporales, ver una vez, con foto, etc.)
+function getText(m) {
+  let msg = m.message;
+  for (let i = 0; i < 5 && msg; i++) {
+    const inner = msg.ephemeralMessage || msg.viewOnceMessage || msg.viewOnceMessageV2 || msg.documentWithCaptionMessage || msg.editedMessage;
+    if (!inner?.message) break;
+    msg = inner.message;
+  }
+  return msg?.conversation || msg?.extendedTextMessage?.text || msg?.imageMessage?.caption || msg?.videoMessage?.caption || '';
+}
+const repliedIds = new Set();
 async function handleCommands(m) {
-  if (!config.binCommandEnabled) return;
   const jid = m.key.remoteJid;
   if (!jid || jid === 'status@broadcast' || jid.endsWith('@newsletter')) return;
-  // En grupos solo responde en los grupos marcados; en privado responde a cualquiera.
-  if (jid.endsWith('@g.us') && !isManagedGroup(jid)) return;
-  const text = m.message?.conversation || m.message?.extendedTextMessage?.text || '';
+  const text = getText(m);
   if (!/^\s*[.!/]bin\b/i.test(text)) return;
+  if (repliedIds.has(m.key.id)) return;
+  repliedIds.add(m.key.id); if (repliedIds.size > 500) repliedIds.clear();
+  const where = jid.endsWith('@g.us') ? (groupList.find(g => g.id === jid)?.subject || 'grupo') : 'chat privado';
+  console.info(`[Bot] Comando .bin recibido en ${where}.`);
+  if (!config.binCommandEnabled) { log('Comando .bin ignorado: está desactivado en el panel.'); return; }
+  // En grupos solo responde en los grupos marcados; en privado responde a cualquiera.
+  if (jid.endsWith('@g.us') && !isManagedGroup(jid)) { log(`Comando .bin ignorado en "${where}": ese grupo no está marcado en el panel.`); return; }
   const reply = await handleBinCommand(text, m.key.participant || jid);
   if (!reply) return;
-  try { await sock.sendMessage(jid, { text: reply }, { quoted: m }); }
-  catch (e) { log('No se pudo responder .bin: ' + e.message); }
+  try { await sock.sendMessage(jid, { text: reply }, { quoted: m }); log(`Respondí .bin en ${where}.`); }
+  catch (e) { log('No se pudo responder .bin: ' + e.message); console.error('[Bot] .bin send failed:', e.message); }
 }
 let lastSent = Date.now();
 setInterval(async () => {
