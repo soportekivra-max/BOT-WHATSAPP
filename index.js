@@ -12,6 +12,7 @@ const app = express();
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(express.json({ limit: '10mb' }));
 const { parseContacts, fillTemplate } = require('./contacts');
+const { initBinCache, handleBinCommand } = require('./bin');
 const PORT = process.env.PORT || 3000;
 const PANEL_PASSWORD = process.env.ADMIN_PASSWORD || process.env.PANEL_PASSWORD || require('crypto').randomBytes(6).toString('hex');
 if (!process.env.ADMIN_PASSWORD && !process.env.PANEL_PASSWORD) console.log('Contrasena temporal del panel (usuario admin): ' + PANEL_PASSWORD);
@@ -40,9 +41,11 @@ config = {
   broadcastDailyLimit: 150,
   broadcastMinDelaySec: 20,
   broadcastMaxDelaySec: 45,
+  binCommandEnabled: true,
   ...config
 };
 const isManagedGroup = jid => config.groupJids.includes(jid);
+initBinCache(DATA_DIR);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ---- Envío a contactos (cola guardada en disco: si el bot se reinicia o cambias de número, sigue donde se quedó) ----
@@ -223,7 +226,7 @@ async function connect({ manual = false } = {}) {
     socket.ev.on('groups.update', () => refreshGroups());
     socket.ev.on('messages.upsert', async ({ messages, type }) => {
       if (sock !== socket || type !== 'notify') return;
-      for (const m of messages) await moderate(m);
+      for (const m of messages) { await moderate(m); await handleCommands(m); }
     });
   } catch (e) {
     if (socket && sock === socket) sock = null;
@@ -276,6 +279,19 @@ async function moderate(m) {
       log(`Advertencia a ${sender}: ${reason}`);
     }
   } catch (e) { log('Error de moderación. Verifica que el bot sea administrador: ' + e.message); }
+}
+async function handleCommands(m) {
+  if (!config.binCommandEnabled) return;
+  const jid = m.key.remoteJid;
+  if (!jid || jid === 'status@broadcast' || jid.endsWith('@newsletter')) return;
+  // En grupos solo responde en los grupos marcados; en privado responde a cualquiera.
+  if (jid.endsWith('@g.us') && !isManagedGroup(jid)) return;
+  const text = m.message?.conversation || m.message?.extendedTextMessage?.text || '';
+  if (!/^\s*[.!/]bin\b/i.test(text)) return;
+  const reply = await handleBinCommand(text, m.key.participant || jid);
+  if (!reply) return;
+  try { await sock.sendMessage(jid, { text: reply }, { quoted: m }); }
+  catch (e) { log('No se pudo responder .bin: ' + e.message); }
 }
 let lastSent = Date.now();
 setInterval(async () => {
@@ -413,6 +429,7 @@ app.get('/', async (req, res) => {
   <label>Ventana en segundos</label><input name="windowSeconds" type="number" min="1" value="${config.windowSeconds}">
   <label>Advertencias antes de expulsar</label><input name="warningsBeforeKick" type="number" min="0" value="${config.warningsBeforeKick}">
   <label>Números administradores protegidos (con código de país, separados por coma)</label><input name="adminNumbers" value="${esc(config.adminNumbers.join(', '))}">
+  <label><input style="width:auto" type="checkbox" name="binCommandEnabled" ${config.binCommandEnabled?'checked':''}> Comando .bin activo (ej. “.bin 457173”: banco, marca, tipo y país)</label>
   <label><input style="width:auto" type="checkbox" name="enabled" ${config.enabled?'checked':''}> Bot activo</label><button>Guardar configuración</button></section></form>
   ${broadcastPanel}${profilePanel}${changeNumberPanel}
   <section><h2>Actividad reciente</h2><div class="log">${esc(logs.join('\n')) || 'Sin actividad todavía.'}</div></section>
@@ -429,6 +446,7 @@ app.post('/save', (req, res) => {
   config.warningsBeforeKick = Math.max(0, Number(req.body.warningsBeforeKick) || 0);
   config.adminNumbers = (req.body.adminNumbers || '').split(',').map(x=>digits(x.trim())).filter(Boolean);
   config.enabled = req.body.enabled === 'on';
+  config.binCommandEnabled = req.body.binCommandEnabled === 'on';
   save(); log('Configuración guardada.'); res.redirect('/');
 });
 app.post('/broadcast/start', (req, res) => {
