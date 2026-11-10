@@ -24,6 +24,29 @@ app.use((req, res, next) => {
   res.set('WWW-Authenticate', 'Basic realm="Multi Bot"').status(401).send('Acceso restringido');
 });
 
+// ---- Importar el bot anterior (un solo número) si existe y aún no hay números ----
+(function migrateLegacy() {
+  const oldAuth = process.env.AUTH_DIR ? path.resolve(process.env.AUTH_DIR) : path.join(DATA_DIR, 'auth_info');
+  const oldCfg = path.join(DATA_DIR, 'config.json');
+  if (fs.readdirSync(SESS_DIR).length || !fs.existsSync(path.join(oldAuth, 'creds.json'))) return;
+  const id = crypto.randomBytes(4).toString('hex');
+  const dir = path.join(SESS_DIR, id);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.cpSync(oldAuth, path.join(dir, 'auth'), { recursive: true });
+  let old = {};
+  try { old = JSON.parse(fs.readFileSync(oldCfg, 'utf8')); } catch {}
+  const keep = ['intervalMinutes', 'scheduledMessage', 'blockedWords', 'blockLinks', 'maxMessagesPerWindow', 'windowSeconds',
+    'warningsBeforeKick', 'adminNumbers', 'enabled', 'profileStatus', 'defaultCountryCode', 'broadcastMessage',
+    'broadcastDailyLimit', 'broadcastMinDelaySec', 'broadcastMaxDelaySec'];
+  const cfg = { name: 'Mi número (bot anterior)', client: 'Yo', createdAt: Date.now(), expiresAt: 0, active: true,
+    groupJids: Array.isArray(old.groupJids) ? old.groupJids : old.groupJid ? [old.groupJid] : [] };
+  for (const k of keep) if (old[k] !== undefined) cfg[k] = old[k];
+  fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify(cfg, null, 2));
+  // Se renombra la sesión vieja para que nunca se usen las dos a la vez.
+  fs.renameSync(oldAuth, oldAuth + '_importado');
+  console.info('[Multi Bot] Se importó el número del bot anterior con sus grupos y reglas.');
+})();
+
 // ---- Sesiones ----
 const sessions = new Map();
 for (const id of fs.readdirSync(SESS_DIR)) {
