@@ -1,609 +1,355 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-const QRCode = require('qrcode');
-const pino = require('pino');
-const {
-  default: makeWASocket, useMultiFileAuthState,
-  fetchLatestBaileysVersion, Browsers
-} = require('@whiskeysockets/baileys');
+const crypto = require('crypto');
+const { Session, DAY } = require('./session');
+
+// ---- Configuración (variables de entorno en Render) ----
+// ADMIN_PASSWORD  contraseña del panel (usuario: admin)
+// DATA_DIR        opcional; por defecto /var/data si existe el disco
+const PORT = process.env.PORT || 3000;
+const PANEL_PASSWORD = process.env.ADMIN_PASSWORD || process.env.PANEL_PASSWORD || crypto.randomBytes(6).toString('hex');
+if (!process.env.ADMIN_PASSWORD && !process.env.PANEL_PASSWORD) console.log('Contrasena temporal del panel (usuario admin): ' + PANEL_PASSWORD);
+const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/var/data') ? '/var/data' : __dirname);
+const SESS_DIR = path.join(DATA_DIR, 'sessions');
+fs.mkdirSync(SESS_DIR, { recursive: true });
 
 const app = express();
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-app.use(express.json({ limit: '10mb' }));
-const { parseContacts, fillTemplate } = require('./contacts');
-const { initBinCache, handleBinCommand } = require('./bin');
-const PORT = process.env.PORT || 3000;
-const PANEL_PASSWORD = process.env.ADMIN_PASSWORD || process.env.PANEL_PASSWORD || require('crypto').randomBytes(6).toString('hex');
-if (!process.env.ADMIN_PASSWORD && !process.env.PANEL_PASSWORD) console.log('Contrasena temporal del panel (usuario admin): ' + PANEL_PASSWORD);
 app.get('/healthz', (req, res) => res.send('ok'));
 app.use((req, res, next) => {
   const h = req.headers.authorization || '';
   const [u, ...rest] = Buffer.from(h.replace(/^Basic /, ''), 'base64').toString().split(':');
   if (u === 'admin' && rest.join(':') === PANEL_PASSWORD) return next();
-  res.set('WWW-Authenticate', 'Basic realm="AD Bot"').status(401).send('Acceso restringido');
+  res.set('WWW-Authenticate', 'Basic realm="Multi Bot"').status(401).send('Acceso restringido');
 });
-// La configuración se guarda en el disco persistente si existe (Render: /var/data),
-// para que los grupos y reglas no se pierdan en cada deploy.
-const DEFAULT_CFG = path.join(__dirname, 'config.json');
-const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/var/data') ? '/var/data' : __dirname);
-const CFG = process.env.CONFIG_PATH ? path.resolve(process.env.CONFIG_PATH) : path.join(DATA_DIR, 'config.json');
-if (!fs.existsSync(CFG)) fs.copyFileSync(DEFAULT_CFG, CFG);
-const AUTH = process.env.AUTH_DIR ? path.resolve(process.env.AUTH_DIR) : path.join(DATA_DIR, 'auth_info');
-let config = JSON.parse(fs.readFileSync(CFG, 'utf8'));
-// Migración: de un solo grupo (groupJid) a varios (groupJids).
-if (!Array.isArray(config.groupJids)) config.groupJids = config.groupJid ? [config.groupJid] : [];
-delete config.groupJid;
-config = {
-  defaultCountryCode: '52',
-  profileStatus: '',
-  broadcastMessage: 'Hola {nombre} 👋 Este número es un bot automático. Mi número personal nuevo está en la descripción de este perfil, guárdalo por favor 🙏',
-  broadcastDailyLimit: 150,
-  broadcastMinDelaySec: 20,
-  broadcastMaxDelaySec: 45,
-  binCommandEnabled: true,
-  ...config
-};
-const isManagedGroup = jid => config.groupJids.includes(jid);
-initBinCache(DATA_DIR);
-const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// ---- Envío a contactos (cola guardada en disco: si el bot se reinicia o cambias de número, sigue donde se quedó) ----
-const BCAST = path.join(DATA_DIR, 'broadcast.json');
-const emptyBroadcast = () => ({ status: 'idle', message: '', queue: [], sent: 0, notOnWhatsApp: 0, failed: 0, total: 0, day: '', sentToday: 0, lastError: '' });
-let broadcast = fs.existsSync(BCAST) ? { ...emptyBroadcast(), ...JSON.parse(fs.readFileSync(BCAST, 'utf8')) } : emptyBroadcast();
-const saveBroadcast = () => fs.writeFileSync(BCAST, JSON.stringify(broadcast));
-let broadcastLoopRunning = false;
-const today = () => new Date().toLocaleDateString('es-MX', { timeZone: process.env.TZ || 'America/Mexico_City' });
+// ---- Sesiones ----
+const sessions = new Map();
+for (const id of fs.readdirSync(SESS_DIR)) {
+  const dir = path.join(SESS_DIR, id);
+  if (fs.statSync(dir).isDirectory()) sessions.set(id, new Session(dir, id));
+}
+// Arranca las conexiones de una en una para no saturar al iniciar.
+(async () => { for (const s of sessions.values()) { s.connect(); await new Promise(r => setTimeout(r, 2500)); } })();
 
-async function runBroadcast() {
-  if (broadcastLoopRunning) return;
-  broadcastLoopRunning = true;
-  try {
-    while (broadcast.status === 'running' && broadcast.queue.length) {
-      if (!sock || connection !== 'Conectado') { await sleep(30_000); continue; }
-      if (broadcast.day !== today()) { broadcast.day = today(); broadcast.sentToday = 0; saveBroadcast(); }
-      if (broadcast.sentToday >= config.broadcastDailyLimit) { await sleep(5 * 60_000); continue; }
-      const c = broadcast.queue[0];
-      try {
-        const [res] = await sock.onWhatsApp(c.number);
-        if (!res?.exists) {
-          broadcast.notOnWhatsApp++;
-        } else {
-          await sock.sendMessage(res.jid, { text: fillTemplate(broadcast.message, c.name) });
-          broadcast.sent++; broadcast.sentToday++;
-        }
-        broadcast.queue.shift();
-      } catch (e) {
-        broadcast.lastError = e.message;
-        // Si se cayó la conexión, no se descarta el contacto: se reintenta al reconectar.
-        if (!sock || connection !== 'Conectado') { saveBroadcast(); continue; }
-        broadcast.failed++; broadcast.queue.shift();
-        log(`No se pudo enviar a +${c.number}: ${e.message}`);
-      }
-      if (!broadcast.queue.length) { broadcast.status = 'done'; log(`Envío a contactos terminado: ${broadcast.sent} enviados.`); }
-      saveBroadcast();
-      const min = config.broadcastMinDelaySec, max = Math.max(min, config.broadcastMaxDelaySec);
-      if (broadcast.queue.length) await sleep((min + Math.random() * (max - min)) * 1000);
-    }
-  } finally {
-    broadcastLoopRunning = false;
-  }
-}
-
-async function applyProfileStatus() {
-  if (!sock || connection !== 'Conectado' || !config.profileStatus) return;
-  try { await sock.updateProfileStatus(config.profileStatus.slice(0, 139)); log('Descripción del perfil actualizada.'); }
-  catch (e) { log('No se pudo actualizar la descripción del perfil: ' + e.message); }
-}
-let sock, qrDataUrl = '', connection = 'Desconectado';
-let sessionRegistered = false;
-let pairingCode = '', pairingStatus = '';
-let pairingRequestInProgress = false, pairingCodeIssued = false;
-let lastPairingAttemptAt = 0, lastConnectAttemptAt = 0, lastManualReconnectAt = 0;
-let connectInProgress = false, reconnectTimer = null;
-let socketAttempts = 0;
-const RETRY_INTERVAL_MS = 60_000;
-const MANUAL_RECONNECT_COOLDOWN_MS = 10 * 60 * 1000;
-let lastErrorCode = null, lastErrorMessage = '', manualReconnectStatus = '';
-let groupList = [], recent = new Map(), warnings = new Map(), logs = [];
-const save = () => fs.writeFileSync(CFG, JSON.stringify(config, null, 2));
-const log = (s) => { logs.unshift(new Date().toLocaleString('es-MX') + ' — ' + s); logs = logs.slice(0, 100); };
-const esc = s => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-const digits = s => (s || '').replace(/\D/g, '');
-const maskPhoneNumber = number => `${'*'.repeat(Math.max(0, number.length - 4))}${number.slice(-4)}`;
-const getErrorCode = error => error?.output?.statusCode ?? error?.statusCode ?? error?.code ?? null;
-const getErrorDetails = error => error ? {
-  name: error.name || 'Error',
-  message: String(error.message || error).slice(0, 400),
-  code: getErrorCode(error)
-} : null;
-const rememberError = error => {
-  const details = getErrorDetails(error);
-  if (details) {
-    lastErrorCode = details.code;
-    lastErrorMessage = details.message;
-  }
-  return details;
-};
-const requiresManualReconnect = code => [401, 408].includes(Number(code));
-const isAdmin = jid => config.adminNumbers.map(digits).includes(digits(jid.split('@')[0]));
-
-function scheduleReconnect(disconnectCode = null) {
-  if (requiresManualReconnect(disconnectCode)) {
-    console.warn(`[Baileys] Automatic reconnect skipped for error code ${disconnectCode}.`);
-    return;
-  }
-  if (reconnectTimer) return;
-  const delay = Math.max(0, RETRY_INTERVAL_MS - (Date.now() - lastConnectAttemptAt));
-  console.warn(`[Baileys] Reconnect scheduled in ${Math.ceil(delay / 1000)}s.`);
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    console.warn('[Baileys] Restarting socket after connection close.');
-    connect();
-  }, delay);
-}
-
-async function connect({ manual = false } = {}) {
-  if (connectInProgress || sock) return false;
-  const delay = RETRY_INTERVAL_MS - (Date.now() - lastConnectAttemptAt);
-  if (!manual && lastConnectAttemptAt && delay > 0) {
-    scheduleReconnect();
-    return false;
-  }
-
-  connectInProgress = true;
-  lastConnectAttemptAt = Date.now();
-  socketAttempts += 1;
-  connection = manual ? 'Reconectando' : 'Conectando';
-  console.info(`[Baileys] Starting ${manual ? 'manual ' : ''}socket attempt ${socketAttempts}.`);
-  let socket;
-  try {
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH);
-    sessionRegistered = Boolean(state.creds.registered);
-    const { version, isLatest } = await fetchLatestBaileysVersion(); console.info('[Baileys] version', version.join('.'), 'isLatest', isLatest);
-    socket = makeWASocket({ version, auth: state, logger: pino({ level: 'silent' }), printQRInTerminal: false, browser: Browsers.ubuntu('Chrome') });
-    sock = socket;
-    socket.ev.on('creds.update', async () => {
-      if (sock !== socket) return;
-      await saveCreds();
-      sessionRegistered = Boolean(state.creds.registered);
-      if (sessionRegistered) {
-        pairingCode = '';
-        pairingCodeIssued = false;
-        pairingStatus = 'Esta sesión ya está registrada.';
-      }
-    });
-    socket.ev.on('connection.update', async u => {
-      const disconnectError = u.lastDisconnect?.error;
-      const disconnectDetails = rememberError(disconnectError);
-      console.info('[Baileys] connection.update', JSON.stringify({
-        state: u.connection ?? null,
-        lastDisconnectError: disconnectDetails,
-        hasQr: Boolean(u.qr)
-      }));
-      if (sock !== socket) return;
-      if (u.connection === 'connecting') connection = 'Conectando';
-      if (u.qr) { qrDataUrl = await QRCode.toDataURL(u.qr); connection = 'Escanea el QR'; }
-      if (u.connection === 'open') {
-        connection = 'Conectado';
-        sessionRegistered = Boolean(state.creds.registered);
-        qrDataUrl = '';
-        pairingCode = '';
-        if (sessionRegistered) pairingCodeIssued = false;
-        pairingStatus = sessionRegistered ? 'Esta sesión ya está registrada.' : '';
-        console.info('[Baileys] Socket connected.');
-        log('WhatsApp conectado.');
-        refreshGroups();
-        applyProfileStatus();
-        runBroadcast();
-      }
-      if (u.connection === 'close') {
-        connection = 'Desconectado';
-        qrDataUrl = '';
-        pairingCode = '';
-        sock = null;
-        const code = getErrorCode(disconnectError);
-        console.warn(`[Baileys] Socket closed. disconnectCode=${code ?? 'none'}.`);
-        if (requiresManualReconnect(code)) {
-          manualReconnectStatus = Number(code) === 401
-            ? 'WhatsApp cerró la sesión (error 401): el número se desvinculó o fue baneado. Usa “Desvincular y conectar otro número”.'
-            : `No habrá reconexión automática para el error ${code}. Usa “Reconectar ahora” cuando quieras hacer un intento manual.`;
-          console.warn(`[Baileys] Automatic socket restart disabled for error code ${code}.`);
-          if (Number(code) === 401) log('Sesión cerrada por WhatsApp (401). Si el número fue baneado, conecta otro desde el panel.');
-        } else if (pairingCodeIssued || pairingRequestInProgress) {
-          pairingStatus = 'El socket se cerró durante la vinculación; no se reiniciará automáticamente.';
-          console.warn('[Baileys] Automatic socket restart skipped during or after pairing-code generation.');
-        } else if (manual) {
-          manualReconnectStatus = 'El intento manual terminó. No se programó otro intento automático.';
-          console.warn('[Baileys] Manual socket attempt ended; no automatic retry scheduled.');
-        } else {
-          pairingStatus = 'Conexión cerrada. Se intentará reconectar como máximo una vez por minuto.';
-          scheduleReconnect(code);
-        }
-      }
-    });
-    socket.ev.on('groups.update', () => refreshGroups());
-    socket.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (sock !== socket) return;
-      for (const m of messages) {
-        // 'append' = mensajes enviados desde el mismo teléfono del bot: solo se usan para comandos
-        if (type === 'notify') await moderate(m);
-        if (type === 'notify' || m.key.fromMe) await handleCommands(m);
-      }
-    });
-  } catch (e) {
-    if (socket && sock === socket) sock = null;
-    connection = 'Desconectado';
-    const details = rememberError(e);
-    console.error('[Baileys] Socket initialization failed:', details);
-    log('Error al iniciar: ' + e.message);
-    if (requiresManualReconnect(details?.code)) {
-      manualReconnectStatus = `No habrá reconexión automática para el error ${details.code}. Usa “Reconectar ahora” cuando quieras hacer un intento manual.`;
-      console.warn(`[Baileys] Automatic socket restart disabled for error code ${details.code}.`);
-    } else if (manual) {
-      manualReconnectStatus = 'El intento manual terminó. No se programó otro intento automático.';
-      console.warn('[Baileys] Manual socket attempt ended; no automatic retry scheduled.');
-    } else {
-      scheduleReconnect(details?.code);
-    }
-  } finally {
-    connectInProgress = false;
-  }
-}
-async function refreshGroups() {
-  try { groupList = Object.values(await sock.groupFetchAllParticipating()); }
-  catch (e) { log('No se pudieron cargar grupos: ' + e.message); }
-}
-async function moderate(m) {
-  const jid = m.key.remoteJid;
-  if (!jid || !jid.endsWith('@g.us') || m.key.fromMe || !config.enabled || !isManagedGroup(jid)) return;
-  const sender = m.key.participant || '';
-  if (!sender || isAdmin(sender)) return;
-  const text = getText(m).toLowerCase();
-  const hasLink = /(https?:\/\/|www\.|chat\.whatsapp\.com\/)/i.test(text);
-  const blocked = config.blockedWords.some(w => w && text.includes(w.toLowerCase()));
-  const now = Date.now();
-  const key = jid + ':' + sender;
-  const arr = (recent.get(key) || []).filter(t => now - t < config.windowSeconds * 1000);
-  arr.push(now); recent.set(key, arr);
-  const flood = arr.length > config.maxMessagesPerWindow;
-  if (!(blocked || (config.blockLinks && hasLink) || flood)) return;
-  const reason = blocked ? 'palabra prohibida' : hasLink ? 'enlace no autorizado' : 'flood/spam';
-  try { await sock.sendMessage(jid, { delete: m.key }); } catch (e) { log('No pude borrar mensaje: ' + e.message); }
-  const count = (warnings.get(key) || 0) + 1; warnings.set(key, count);
-  try {
-    if (count > config.warningsBeforeKick) {
-      await sock.groupParticipantsUpdate(jid, [sender], 'remove');
-      warnings.delete(key);
-      log(`Expulsado ${sender} de ${jid}: ${reason}`);
-      await sock.sendMessage(jid, { text: `⛔ Usuario expulsado por ${reason}.` });
-    } else {
-      await sock.sendMessage(jid, { text: `⚠️ @${sender.split('@')[0]}, mensaje eliminado por ${reason}. Una infracción más puede causar expulsión.`, mentions: [sender] });
-      log(`Advertencia a ${sender}: ${reason}`);
-    }
-  } catch (e) { log('Error de moderación. Verifica que el bot sea administrador: ' + e.message); }
-}
-// Saca el texto aunque venga envuelto (mensajes temporales, ver una vez, con foto, etc.)
-function getText(m) {
-  let msg = m.message;
-  for (let i = 0; i < 5 && msg; i++) {
-    const inner = msg.ephemeralMessage || msg.viewOnceMessage || msg.viewOnceMessageV2 || msg.documentWithCaptionMessage || msg.editedMessage;
-    if (!inner?.message) break;
-    msg = inner.message;
-  }
-  return msg?.conversation || msg?.extendedTextMessage?.text || msg?.imageMessage?.caption || msg?.videoMessage?.caption || '';
-}
-const repliedIds = new Set();
-async function handleCommands(m) {
-  const jid = m.key.remoteJid;
-  if (!jid || jid === 'status@broadcast' || jid.endsWith('@newsletter')) return;
-  const text = getText(m);
-  if (!/^\s*[.!/]bin\b/i.test(text)) return;
-  if (repliedIds.has(m.key.id)) return;
-  repliedIds.add(m.key.id); if (repliedIds.size > 500) repliedIds.clear();
-  const where = jid.endsWith('@g.us') ? (groupList.find(g => g.id === jid)?.subject || 'grupo') : 'chat privado';
-  console.info(`[Bot] Comando .bin recibido en ${where}.`);
-  if (!config.binCommandEnabled) { log('Comando .bin ignorado: está desactivado en el panel.'); return; }
-  // En grupos solo responde en los grupos marcados; en privado responde a cualquiera.
-  if (jid.endsWith('@g.us') && !isManagedGroup(jid)) { log(`Comando .bin ignorado en "${where}": ese grupo no está marcado en el panel.`); return; }
-  const reply = await handleBinCommand(text, m.key.participant || jid);
-  if (!reply) return;
-  try { await sock.sendMessage(jid, { text: reply }, { quoted: m }); log(`Respondí .bin en ${where}.`); }
-  catch (e) { log('No se pudo responder .bin: ' + e.message); console.error('[Bot] .bin send failed:', e.message); }
-}
-let lastSent = Date.now();
-setInterval(async () => {
-  if (!sock || connection !== 'Conectado' || !config.enabled || !config.groupJids.length || !config.scheduledMessage) return;
-  if (Date.now() - lastSent < config.intervalMinutes * 60 * 1000) return;
-  lastSent = Date.now();
-  const groupName = jid => groupList.find(g => g.id === jid)?.subject || jid;
-  for (const [i, jid] of [...config.groupJids].entries()) {
-    if (i > 0) await sleep(3000 + Math.random() * 4000); // pausa entre grupos para no parecer spam
-    if (!sock || connection !== 'Conectado') break;
-    try { await sock.sendMessage(jid, { text: config.scheduledMessage }); log(`Mensaje programado enviado a ${groupName(jid)}.`); }
-    catch (e) { log(`Error al enviar mensaje programado a ${groupName(jid)}: ${e.message}`); }
+// Reloj global: avisos programados y vencimientos de renta.
+setInterval(() => {
+  for (const s of sessions.values()) {
+    if (s.expired && !s.config.expiredNotified) { s.config.expiredNotified = true; s.save(); s.log('⏰ La renta venció: avisos, moderación y envíos quedan en pausa hasta que la renueves.'); }
+    s.tickAvisos().catch(e => s.log('Error en avisos: ' + e.message));
   }
 }, 60 * 1000);
 
-app.get('/', async (req, res) => {
-  const qr = qrDataUrl ? `<img style="width:230px" src="${qrDataUrl}"><p>Escanea desde WhatsApp → Dispositivos vinculados → Vincular dispositivo.</p>` : '<p>No hay QR disponible. Actualiza cuando aparezca “Escanea el QR”.</p>';
-  const canRequestPairingCode = Boolean(sock) && connection === 'Escanea el QR' && !sessionRegistered;
-  const manualReconnectRemaining = Math.max(0, MANUAL_RECONNECT_COOLDOWN_MS - (Date.now() - lastManualReconnectAt));
-  const canReconnectManually = !sock && !connectInProgress && manualReconnectRemaining === 0;
-  const manualReconnectWait = manualReconnectRemaining > 0
-    ? `<p>Próximo intento manual disponible en ${Math.ceil(manualReconnectRemaining / 60000)} min.</p>`
-    : '';
-  const reconnectPanel = `<section><h2>Reconexión manual</h2>
-  <form method="post" action="/reconnect-now"><button type="submit" ${canReconnectManually ? '' : 'disabled'}>Reconectar ahora</button></form>
-  <p>Un intento manual como máximo cada 10 minutos.</p>
-  ${manualReconnectWait}${manualReconnectStatus ? `<p role="status">${esc(manualReconnectStatus)}</p>` : ''}</section>`;
-  const errorPanel = lastErrorCode !== null || lastErrorMessage
-    ? `<section><h2>Último error de conexión</h2><p>Código: ${esc(lastErrorCode ?? 'No disponible')}</p><p>Motivo: ${esc(lastErrorMessage || 'Sin mensaje')}</p></section>`
-    : '';
-  const pairingPanel = sessionRegistered ? '' : `<section><h2>Vincular por número</h2>
-  <p>Escribe el número con código de país, solo dígitos y sin +. También puedes usar el QR.</p>
-  <form method="post" action="/pairing-code">
-    <label for="phoneNumber">Número de teléfono</label>
-    <input id="phoneNumber" name="phoneNumber" type="tel" inputmode="numeric" autocomplete="tel" pattern="[0-9]{8,15}" minlength="8" maxlength="15" placeholder="521..." required>
-    <button type="submit" ${canRequestPairingCode ? '' : 'disabled'}>Generar código</button>
+// ---- Utilidades de panel ----
+const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+const digits = s => String(s || '').replace(/\D/g, '');
+const fmtDate = ms => ms ? new Date(ms).toLocaleDateString('es-MX', { timeZone: 'America/Cancun', day: 'numeric', month: 'short', year: 'numeric' }) : 'Sin vencimiento';
+const toInputDate = ms => ms ? new Date(ms - 5 * 3600 * 1000).toISOString().slice(0, 10) : '';
+// Fecha "AAAA-MM-DD" → fin de ese día en hora de Cancún (UTC-5)
+const fromInputDate = v => { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(v || ''); return m ? Date.UTC(+m[1], +m[2] - 1, +m[3], 23, 59, 59) + 5 * 3600 * 1000 : 0; };
+const get = (req, res) => { const s = sessions.get(req.params.id); if (!s) res.status(404).send('No existe ese número.'); return s; };
+
+function rentalBadge(s) {
+  if (!s.config.active) return '<span class="badge off">Pausado</span>';
+  if (!s.config.expiresAt) return '<span class="badge ok">Sin vencimiento</span>';
+  const d = s.daysLeft;
+  if (d <= 0) return '<span class="badge bad">Vencido</span>';
+  if (d <= 3) return `<span class="badge warn">Vence en ${d} día${d === 1 ? '' : 's'}</span>`;
+  return `<span class="badge ok">${d} días</span>`;
+}
+function connBadge(s) {
+  const cls = s.isConnected ? 'ok' : s.needsRelink ? 'bad' : s.connection === 'Escanea el QR' ? 'warn' : 'off';
+  return `<span class="badge ${cls}">${esc(s.connection)}</span>`;
+}
+
+const CSS = `
+:root{color-scheme:dark;--bg:#080808;--gold:#E3B04B;--gold-light:#F5D58A;--text:#F5F1E8;--muted:#AAA39A;--line:rgba(227,176,75,.22);}
+*{box-sizing:border-box}
+html{min-height:100%;background:var(--bg)}
+body{font:15px/1.6 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;background:radial-gradient(ellipse at 50% -18%,rgba(227,176,75,.14),transparent 48%),radial-gradient(ellipse at 100% 40%,rgba(227,176,75,.045),transparent 35%),var(--bg);color:var(--text);max-width:980px;margin:0 auto;padding:34px 20px 60px;}
+a{color:var(--gold-light);text-decoration:none}
+h1{color:var(--gold-light);font-size:clamp(25px,4vw,36px);font-weight:800;letter-spacing:.045em;margin:0 0 8px;padding:8px 0 10px;text-shadow:0 0 24px rgba(227,176,75,.2);}
+h2{font-size:18px;line-height:1.35;color:var(--gold-light);font-weight:750;margin:0 0 15px;}
+body>p{color:var(--muted);margin:6px 0 16px;}
+section{background:linear-gradient(145deg,rgba(25,25,25,.98),rgba(13,13,13,.98));border:1px solid var(--line);padding:22px;border-radius:18px;margin:16px 0;box-shadow:0 12px 35px rgba(0,0,0,.28),inset 0 1px 0 rgba(255,255,255,.025);}
+section>p{color:#C8C0B4}
+label{display:block;color:#E8DDC8;font-size:13px;font-weight:650;margin:12px 0 5px;}
+input,textarea{width:100%;padding:12px 14px;margin:7px 0 14px;background:#090909;color:var(--text);border:1px solid #39332A;border-radius:11px;font:inherit;outline:none;transition:border-color .2s,box-shadow .2s;}
+input:focus,textarea:focus{border-color:var(--gold);box-shadow:0 0 0 3px rgba(227,176,75,.12);background:#0D0C0A;}
+input[type=checkbox]{width:auto;accent-color:var(--gold);margin:0 8px 0 0}
+input[type=file]{padding:10px;color:var(--muted)}
+textarea{resize:vertical;min-height:90px}
+button{background:linear-gradient(135deg,var(--gold-light),var(--gold) 65%,#C58A2B);color:#171109;border:1px solid rgba(255,230,170,.5);padding:12px 19px;border-radius:11px;font-family:inherit;font-size:13px;font-weight:750;letter-spacing:.025em;cursor:pointer;box-shadow:0 5px 18px rgba(227,176,75,.13);}
+button:disabled{opacity:.42;cursor:not-allowed;box-shadow:none}
+button.ghost{background:transparent;color:var(--gold-light);border-color:var(--line);box-shadow:none}
+button.danger{background:#ff5c5c;border-color:#ff8a8a;color:#1a0505}
+button.warnb{background:#ffb84d;border-color:#ffd08a}
+form{margin:0}.inline{display:inline-block;margin:4px 6px 4px 0}
+small{color:var(--muted)}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.row>input{flex:1;min-width:120px}
+.badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:700;border:1px solid}
+.badge.ok{color:#7be3a0;border-color:rgba(123,227,160,.4);background:rgba(123,227,160,.08)}
+.badge.warn{color:#ffd08a;border-color:rgba(255,208,138,.4);background:rgba(255,208,138,.08)}
+.badge.bad{color:#ff8a8a;border-color:rgba(255,138,138,.4);background:rgba(255,138,138,.08)}
+.badge.off{color:var(--muted);border-color:#3a352d}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin:14px 0}
+.stat{background:rgba(255,255,255,.025);border:1px solid var(--line);border-radius:14px;padding:12px 14px}
+.stat b{display:block;font-size:24px;color:var(--gold-light)}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
+.card{display:block;background:rgba(255,255,255,.025);border:1px solid rgba(227,176,75,.16);border-radius:14px;padding:14px;color:var(--text)}
+.card h3{margin:0 0 4px;font-size:16px;color:var(--gold-light)}
+.card p{margin:4px 0;color:#C8C0B4;font-size:13px}
+.grps{margin:8px 0 16px;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;}
+.grp{display:flex;align-items:center;gap:10px;padding:11px 13px;background:rgba(255,255,255,.025);border:1px solid rgba(227,176,75,.13);border-radius:10px;color:#E8E0D2;margin:0;font-weight:500}
+.chk{display:flex;align-items:center;font-weight:500}
+.log{white-space:pre-wrap;font-size:12px;line-height:1.7;color:#D6CDBE;background:#090909;border:1px solid #30291F;border-radius:12px;padding:14px;max-height:280px;overflow:auto;}
+p[role=status]{padding:10px 12px;background:rgba(227,176,75,.07);border:1px solid var(--line);border-radius:10px;}
+@media(max-width:600px){body{padding:22px 13px 40px;font-size:14px;}h1{font-size:25px}section{padding:17px;border-radius:15px;margin:12px 0;}h2{font-size:17px}.grps,.cards{grid-template-columns:1fr}}`;
+
+const page = (title, body, refresh = 0) => `<!doctype html><html lang="es"><meta name="viewport" content="width=device-width,initial-scale=1">${refresh ? `<meta http-equiv="refresh" content="${refresh}">` : ''}<title>${esc(title)}</title><style>${CSS}</style>${body}</html>`;
+
+// ---- Panel principal ----
+app.get('/', (req, res) => {
+  const list = [...sessions.values()].sort((a, b) => (a.config.expiresAt || Infinity) - (b.config.expiresAt || Infinity));
+  const connected = list.filter(s => s.isConnected).length;
+  const soon = list.filter(s => s.config.active && s.daysLeft !== null && s.daysLeft > 0 && s.daysLeft <= 3).length;
+  const expired = list.filter(s => s.expired).length;
+  const cards = list.map(s => `<a class="card" href="/s/${s.id}">
+      <h3>${esc(s.label)}</h3>
+      <p>${s.config.client ? 'Cliente: ' + esc(s.config.client) : '<small>Sin cliente</small>'}${s.config.phone ? ' · +' + esc(s.config.phone) : ''}</p>
+      <p>${connBadge(s)} ${rentalBadge(s)}</p>
+      <p><small>Vence: ${fmtDate(s.config.expiresAt)} · ${s.config.groupJids.length} grupo(s)</small></p>
+    </a>`).join('') || '<p>Todavía no tienes números. Agrega el primero abajo.</p>';
+  res.send(page('Multi Bot', `
+  <h1>ABSOLUTE DATA · Multi Bot</h1><p>Todos tus números de WhatsApp en un solo panel.</p>
+  <div class="stats"><div class="stat"><b>${list.length}</b>Números</div><div class="stat"><b>${connected}</b>Conectados</div><div class="stat"><b>${soon}</b>Por vencer (≤3 días)</div><div class="stat"><b>${expired}</b>Vencidos</div></div>
+  <section><h2>Mis números</h2><div class="cards">${cards}</div></section>
+  <section><h2>Agregar número</h2>
+    <form method="post" action="/sessions">
+      <label>Nombre (para identificarlo)</label><input name="name" placeholder="Ej. eSIM 01" required>
+      <label>Cliente que lo renta</label><input name="client" placeholder="Ej. Juan Pérez">
+      <label>Días de renta (0 = sin vencimiento)</label><input name="days" type="number" min="0" value="30">
+      <label>Notas</label><input name="notes" placeholder="Precio, teléfono del cliente, etc.">
+      <button>Crear y mostrar QR</button>
+    </form>
+    <p><small>Después de crearlo, escanea el QR con el teléfono de ese número (WhatsApp → Dispositivos vinculados).</small></p>
+  </section>`));
+});
+
+app.post('/sessions', (req, res) => {
+  const id = crypto.randomBytes(4).toString('hex');
+  const dir = path.join(SESS_DIR, id);
+  fs.mkdirSync(dir, { recursive: true });
+  const s = new Session(dir, id);
+  const days = Math.max(0, Number(req.body.days) || 0);
+  Object.assign(s.config, {
+    name: String(req.body.name || '').trim().slice(0, 40) || 'Número ' + (sessions.size + 1),
+    client: String(req.body.client || '').trim().slice(0, 60),
+    notes: String(req.body.notes || '').trim().slice(0, 300),
+    createdAt: Date.now(), expiresAt: days ? Date.now() + days * DAY : 0, active: true
+  });
+  s.save();
+  sessions.set(id, s);
+  s.log('Número creado.');
+  s.connect();
+  res.redirect('/s/' + id);
+});
+
+// ---- Página de cada número ----
+app.get('/s/:id', (req, res) => {
+  const s = get(req, res); if (!s) return;
+  const c = s.config, b = s.broadcast;
+  const waiting = ['Escanea el QR', 'Conectando'].includes(s.connection) && !s.pairingCode;
+  const conn = s.isConnected
+    ? `<p>✅ Conectado${c.phone ? ' como <b>+' + esc(c.phone) + '</b>' : ''}.</p>`
+    : s.qr
+      ? `<img style="width:230px;max-width:100%;background:#fff;padding:8px;border-radius:12px" src="${s.qr}"><p><small>WhatsApp → Dispositivos vinculados → Vincular dispositivo. La página se actualiza sola.</small></p>
+         <form method="post" action="/s/${s.id}/pairing"><label>O vincula con código (número con código de país, sin +)</label><div class="row"><input name="phone" inputmode="numeric" placeholder="5299..." required><button>Generar código</button></div></form>
+         ${s.pairingCode ? `<p role="status">Código de vinculación: <strong style="font-size:1.5em;letter-spacing:.2em">${esc(s.pairingCode)}</strong><br><small>WhatsApp → Dispositivos vinculados → Vincular con número de teléfono.</small></p>` : ''}`
+      : `<p>Estado: <b>${esc(s.connection)}</b>${s.lastError ? ` · <small>${esc(s.lastError)}</small>` : ''}</p>
+         ${s.needsRelink ? '' : `<form method="post" action="/s/${s.id}/connect" class="inline"><button>Generar QR / Reconectar</button></form>`}`;
+  const known = new Set(s.groupList.map(g => g.id));
+  const groups = [...s.groupList.map(g => ({ id: g.id, name: g.subject })), ...c.groupJids.filter(id => !known.has(id)).map(id => ({ id, name: id + ' (no disponible ahora)' }))]
+    .map(g => `<label class="grp"><input type="checkbox" name="groupJids" value="${esc(g.id)}" ${s.isManagedGroup(g.id) ? 'checked' : ''}> ${esc(g.name)}</label>`).join('') || '<p><small>No hay grupos cargados. Conecta el número y agrégalo a tus grupos.</small></p>';
+  const bStatus = { idle: 'Sin envío', running: 'Enviando…', paused: 'En pausa', done: 'Terminado', cancelled: 'Cancelado' }[b.status] || b.status;
+  const bActive = ['running', 'paused'].includes(b.status);
+  res.send(page(s.label, `
+  <p><a href="/">← Todos los números</a></p>
+  <h1>${esc(s.label)}</h1>
+  <p>${connBadge(s)} ${rentalBadge(s)} ${c.client ? '· ' + esc(c.client) : ''}</p>
+  ${!s.rentalOk ? `<p role="status">⏸️ Este número está ${c.active ? 'vencido' : 'pausado'}: no envía avisos, no modera y no manda mensajes a contactos. Sigue conectado para que al renovar funcione al instante.</p>` : ''}
+
+  <section><h2>Renta</h2>
+    <p>Vence: <b>${fmtDate(c.expiresAt)}</b>${s.daysLeft !== null ? ` (${s.daysLeft > 0 ? 'faltan ' + s.daysLeft + ' días' : 'vencido'})` : ''}</p>
+    <form method="post" action="/s/${s.id}/extend" class="inline"><input type="hidden" name="days" value="30"><button>+30 días</button></form>
+    <form method="post" action="/s/${s.id}/extend" class="inline"><input type="hidden" name="days" value="7"><button class="ghost">+7 días</button></form>
+    <form method="post" action="/s/${s.id}/toggle" class="inline"><button class="ghost">${c.active ? 'Pausar número' : 'Reactivar número'}</button></form>
+    <form method="post" action="/s/${s.id}/rental">
+      <label>Nombre</label><input name="name" value="${esc(c.name)}">
+      <label>Cliente</label><input name="client" value="${esc(c.client)}">
+      <label>Fecha de vencimiento (vacío = sin vencimiento)</label><input name="expiresAt" type="date" value="${toInputDate(c.expiresAt)}">
+      <label>Notas</label><textarea name="notes" rows="2">${esc(c.notes)}</textarea>
+      <button>Guardar renta</button>
+    </form>
+  </section>
+
+  <section><h2>Conexión</h2>${conn}
+    <form method="post" action="/s/${s.id}/reset" onsubmit="return confirm('¿Desvincular este número y conectar otro? Se conservan grupos, reglas y la renta.')" style="margin-top:12px"><button class="warnb">Desvincular y conectar otro número</button></form>
+    <p><small>Úsalo si banean el número o cambias de eSIM. Luego agrega el número nuevo a los grupos y hazlo administrador.</small></p>
+  </section>
+
+  <form method="post" action="/s/${s.id}/save">
+  <section><h2>Grupos y avisos (${c.groupJids.length})</h2>
+    <p><small>Marca los grupos donde este número enviará avisos y moderará.</small></p><div class="grps">${groups}</div>
+    <label>Intervalo de avisos (minutos)</label><input name="intervalMinutes" type="number" min="1" value="${c.intervalMinutes}">
+    <label>Mensaje automático</label><textarea name="scheduledMessage" rows="3">${esc(c.scheduledMessage)}</textarea>
+  </section>
+  <section><h2>Moderación</h2>
+    <label>Palabras prohibidas (separadas por coma)</label><input name="blockedWords" value="${esc(c.blockedWords.join(', '))}">
+    <label class="chk"><input type="checkbox" name="blockLinks" ${c.blockLinks ? 'checked' : ''}> Bloquear enlaces</label>
+    <label>Máximo de mensajes por ventana</label><input name="maxMessagesPerWindow" type="number" min="2" value="${c.maxMessagesPerWindow}">
+    <label>Ventana en segundos</label><input name="windowSeconds" type="number" min="1" value="${c.windowSeconds}">
+    <label>Advertencias antes de expulsar</label><input name="warningsBeforeKick" type="number" min="0" value="${c.warningsBeforeKick}">
+    <label>Números protegidos (con código de país, separados por coma)</label><input name="adminNumbers" value="${esc(c.adminNumbers.join(', '))}">
+    <label class="chk"><input type="checkbox" name="enabled" ${c.enabled ? 'checked' : ''}> Avisos y moderación activos</label>
+    <button>Guardar configuración</button>
+  </section>
   </form>
-  ${pairingStatus ? `<p role="status">${esc(pairingStatus)}</p>` : ''}
-  ${pairingCode ? `<p role="status">Código de vinculación: <strong style="font-size:1.5em;letter-spacing:.2em">${esc(pairingCode)}</strong></p>` : ''}
-  </section>`;
-  const knownIds = new Set(groupList.map(g => g.id));
-  const groups = [
-    ...groupList.map(g => ({ id: g.id, name: g.subject })),
-    // Grupos guardados que ya no aparecen (p. ej. WhatsApp aún cargando) siguen visibles para no perderlos al guardar.
-    ...config.groupJids.filter(id => !knownIds.has(id)).map(id => ({ id, name: id + ' (no disponible ahora)' }))
-  ].map(g => `<label class="grp"><input type="checkbox" name="groupJids" value="${esc(g.id)}" ${isManagedGroup(g.id)?'checked':''}> ${esc(g.name)}</label>`).join('')
-    || '<p>No hay grupos cargados.</p>';
-  const b = broadcast;
-  const statusText = { idle: 'Sin envío', running: 'Enviando…', paused: 'En pausa', done: 'Terminado', cancelled: 'Cancelado' }[b.status] || b.status;
-  const bcastButtons = b.status === 'running'
-    ? `<form method="post" action="/broadcast/pause" style="display:inline"><button>Pausar</button></form>`
-    : b.status === 'paused' ? `<form method="post" action="/broadcast/resume" style="display:inline"><button>Continuar</button></form>` : '';
-  const bcastCancel = ['running', 'paused'].includes(b.status)
-    ? ` <form method="post" action="/broadcast/cancel" style="display:inline" onsubmit="return confirm('¿Cancelar el envío? Los contactos pendientes se descartan.')"><button style="background:#ff5c5c">Cancelar</button></form>` : '';
-  const broadcastPanel = `<section><h2>Mensaje a contactos</h2>
-  <p>Estado: <b>${statusText}</b> · Enviados: ${b.sent} de ${b.total} · Pendientes: ${b.queue.length} · Sin WhatsApp: ${b.notOnWhatsApp} · Fallidos: ${b.failed} · Hoy: ${b.sentToday}/${config.broadcastDailyLimit}</p>
-  ${b.lastError ? `<p><small>Último error: ${esc(b.lastError)}</small></p>` : ''}
-  ${bcastButtons}${bcastCancel}
-  ${['running', 'paused'].includes(b.status) ? '' : `<form method="post" action="/broadcast/start" id="bform">
-    <label>Archivo de contactos (.vcf o .csv) — opcional</label><input type="file" id="cfile" accept=".vcf,.csv,.txt,text/vcard,text/csv">
-    <label>Contactos (uno por línea; puedes poner “Nombre | +52 998 123 4567” o solo el número)</label>
-    <textarea name="contacts" id="ctext" rows="6" placeholder="+52 998 123 4567&#10;Ana | +1 305 555 0123&#10;9981234567"></textarea>
-    <small id="ccount"></small>
-    <label>Código de país para números sin + (10 dígitos)</label><input name="defaultCountryCode" value="${esc(config.defaultCountryCode)}" inputmode="numeric">
-    <label>Mensaje ({nombre} se reemplaza por el nombre del contacto si lo tiene)</label><textarea name="broadcastMessage" rows="4">${esc(config.broadcastMessage)}</textarea>
-    <label>Máximo de mensajes por día</label><input name="broadcastDailyLimit" type="number" min="1" value="${config.broadcastDailyLimit}">
-    <label>Pausa entre mensajes (segundos): mínimo y máximo</label>
-    <div style="display:flex;gap:10px"><input name="broadcastMinDelaySec" type="number" min="5" value="${config.broadcastMinDelaySec}"><input name="broadcastMaxDelaySec" type="number" min="5" value="${config.broadcastMaxDelaySec}"></div>
-    <button onclick="return confirm('¿Empezar a enviar el mensaje a estos contactos?')">Empezar envío</button>
-  </form>
-  <script>
-  (function(){
-    var f=document.getElementById('cfile'),t=document.getElementById('ctext'),c=document.getElementById('ccount');
-    function count(){var n=(t.value.match(/(?:\\+|00)?\\d[\\d\\s().\\-]{6,}\\d/g)||[]).length;c.textContent=n?('≈ '+n+' números detectados'):'';}
-    t.addEventListener('input',count);
-    f.addEventListener('change',function(){var file=f.files[0];if(!file)return;var r=new FileReader();r.onload=function(){
-      var s=String(r.result);
-      if(/BEGIN:VCARD/i.test(s)){ // vCard → "Nombre | número" por línea
-        var out=[];s.split(/BEGIN:VCARD/i).slice(1).forEach(function(card){var ls=card.replace(/\\r?\\n[ \\t]/g,'').split(/\\r?\\n/);
+
+  <section><h2>Mensaje a contactos</h2>
+    <p>Estado: <b>${bStatus}</b> · Enviados: ${b.sent} de ${b.total} · Pendientes: ${b.queue.length} · Sin WhatsApp: ${b.notOnWhatsApp} · Fallidos: ${b.failed} · Hoy: ${b.sentToday}/${c.broadcastDailyLimit}</p>
+    ${b.lastError ? `<p><small>Último error: ${esc(b.lastError)}</small></p>` : ''}
+    ${b.status === 'running' ? `<form method="post" action="/s/${s.id}/broadcast/paused" class="inline"><button>Pausar</button></form>` : ''}
+    ${b.status === 'paused' ? `<form method="post" action="/s/${s.id}/broadcast/running" class="inline"><button>Continuar</button></form>` : ''}
+    ${bActive ? `<form method="post" action="/s/${s.id}/broadcast/cancelled" class="inline" onsubmit="return confirm('¿Cancelar el envío?')"><button class="danger">Cancelar</button></form>` : `
+    <form method="post" action="/s/${s.id}/broadcast/start">
+      <label>Archivo de contactos (.vcf o .csv) — opcional</label><input type="file" id="cfile" accept=".vcf,.csv,.txt,text/vcard,text/csv">
+      <label>Contactos (uno por línea; “Nombre | +52 998 123 4567” o solo el número)</label>
+      <textarea name="contacts" id="ctext" rows="5" placeholder="+52 998 123 4567&#10;Ana | +1 305 555 0123"></textarea><small id="ccount"></small>
+      <label>Código de país para números de 10 dígitos sin +</label><input name="defaultCountryCode" value="${esc(c.defaultCountryCode)}" inputmode="numeric">
+      <label>Mensaje ({nombre} = nombre del contacto)</label><textarea name="broadcastMessage" rows="4">${esc(c.broadcastMessage)}</textarea>
+      <label>Máximo por día</label><input name="broadcastDailyLimit" type="number" min="1" value="${c.broadcastDailyLimit}">
+      <label>Pausa entre mensajes (segundos): mínimo y máximo</label>
+      <div class="row"><input name="broadcastMinDelaySec" type="number" min="5" value="${c.broadcastMinDelaySec}"><input name="broadcastMaxDelaySec" type="number" min="5" value="${c.broadcastMaxDelaySec}"></div>
+      <button onclick="return confirm('¿Empezar el envío?')">Empezar envío</button>
+    </form>
+    <script>
+    (function(){
+      var f=document.getElementById('cfile'),t=document.getElementById('ctext'),c=document.getElementById('ccount');
+      function count(){var n=(t.value.match(/(?:\\+|00)?\\d[\\d\\s().\\-]{6,}\\d/g)||[]).length;c.textContent=n?('≈ '+n+' números detectados'):'';}
+      t.addEventListener('input',count);
+      f.addEventListener('change',function(){var file=f.files[0];if(!file)return;var r=new FileReader();r.onload=function(){
+        var s=String(r.result);
+        if(/BEGIN:VCARD/i.test(s)){var out=[];s.split(/BEGIN:VCARD/i).slice(1).forEach(function(card){var ls=card.replace(/\\r?\\n[ \\t]/g,'').split(/\\r?\\n/);
           var fn=ls.filter(function(l){return /^FN[:;]/i.test(l)})[0];var name=fn?fn.slice(fn.indexOf(':')+1).trim().replace(/[|]/g,' '):'';
           ls.forEach(function(l){if(/^(item\\d+\\.)?TEL[:;]/i.test(l))out.push((name?name+' | ':'')+l.slice(l.lastIndexOf(':')+1).trim());});});
-        s=out.join('\\n');
-      }
-      t.value=(t.value?t.value+'\\n':'')+s;count();};r.readAsText(file);});
-  })();
-  </script>`}
-  </section>`;
-  const profilePanel = `<section><h2>Descripción del perfil del bot</h2>
-  <form method="post" action="/profile-status"><label>Texto del “Info/Descripción” del bot (máx. 139 caracteres). Pon aquí tu número personal.</label>
-  <input name="profileStatus" maxlength="139" value="${esc(config.profileStatus)}" placeholder="🤖 Bot · Mi número personal: +52 998 123 4567">
-  <button>Guardar y aplicar</button><p><small>Se vuelve a poner sola cada vez que el bot se conecta, también con un número nuevo.</small></p></form></section>`;
-  const changeNumberPanel = `<section><h2>Cambiar número del bot</h2>
-  <p>Úsalo si banean el número o quieres usar otro. Se borra la sesión actual y aparece un QR nuevo arriba. Grupos, reglas, mensajes y la cola de contactos se conservan.</p>
-  <p><small>Después agrega el número nuevo a tus grupos y hazlo administrador.</small></p>
-  <form method="post" action="/reset-session" onsubmit="return confirm('¿Desvincular este número y conectar otro?')"><button style="background:#ffb84d">Desvincular y conectar otro número</button></form></section>`;
-  res.send(`<!doctype html><html lang="es"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AD WhatsApp Bot</title>
-  <style>
-  :root{color-scheme:dark;--bg:#080808;--panel:#111111;--gold:#E3B04B;--gold-light:#F5D58A;--text:#F5F1E8;--muted:#AAA39A;--line:rgba(227,176,75,.22);}
-  *{box-sizing:border-box}
-  html{min-height:100%;background:var(--bg)}
-  body{font:15px/1.6 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;background:radial-gradient(ellipse at 50% -18%,rgba(227,176,75,.14),transparent 48%),radial-gradient(ellipse at 100% 40%,rgba(227,176,75,.045),transparent 35%),var(--bg);color:var(--text);max-width:980px;margin:0 auto;padding:34px 20px 60px;}
-  h1{color:var(--gold-light);font-size:clamp(25px,4vw,36px);font-weight:800;letter-spacing:.045em;margin:0 0 8px;padding:8px 0 15px;text-shadow:0 0 24px rgba(227,176,75,.2);}
-  h2{font-size:18px;line-height:1.35;color:var(--gold-light);font-weight:750;margin:0 0 15px;}
-  body>p{color:var(--muted);margin:6px 0 16px;}
-  section{position:relative;background:linear-gradient(145deg,rgba(25,25,25,.98),rgba(13,13,13,.98));border:1px solid var(--line);padding:22px;border-radius:18px;margin:16px 0;box-shadow:0 12px 35px rgba(0,0,0,.28),inset 0 1px 0 rgba(255,255,255,.025);}
-  section>p{color:#C8C0B4}
-  label{display:block;color:#E8DDC8;font-size:13px;font-weight:650;margin:12px 0 5px;}
-  input,textarea,select{box-sizing:border-box;width:100%;padding:12px 14px;margin:7px 0 14px;background:#090909;color:var(--text);border:1px solid #39332A;border-radius:11px;font:inherit;outline:none;transition:border-color .2s,box-shadow .2s,background .2s;}
-  input:focus,textarea:focus,select:focus{border-color:var(--gold);box-shadow:0 0 0 3px rgba(227,176,75,.12);background:#0D0C0A;}
-  input[type=checkbox]{accent-color:var(--gold)}
-  input[type=file]{padding:10px;color:var(--muted)}
-  textarea{resize:vertical;min-height:90px}
-  button{background:linear-gradient(135deg,var(--gold-light),var(--gold) 65%,#C58A2B);color:#171109;border:1px solid rgba(255,230,170,.5);padding:12px 19px;border-radius:11px;font-family:inherit;font-size:13px;font-weight:750;line-height:1.2;letter-spacing:.025em;cursor:pointer;box-shadow:0 5px 18px rgba(227,176,75,.13);transition:transform .18s,filter .18s,box-shadow .18s;}
-  button:hover:not(:disabled){filter:brightness(1.08);transform:translateY(-1px);box-shadow:0 8px 22px rgba(227,176,75,.2);}
-  button:active:not(:disabled){transform:translateY(0)}
-  button:disabled{opacity:.42;cursor:not-allowed;box-shadow:none}
-  form{margin:0}
-  small{color:var(--muted)}
-  .log{white-space:pre-wrap;font-size:12px;line-height:1.7;color:#D6CDBE;background:#090909;border:1px solid #30291F;border-radius:12px;padding:14px;max-height:280px;overflow:auto;}
-  .grps{margin:8px 0 16px;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;}
-  .grp{display:flex;align-items:center;gap:10px;padding:11px 13px;background:rgba(255,255,255,.025);border:1px solid rgba(227,176,75,.13);border-radius:10px;color:#E8E0D2;min-width:0;overflow-wrap:anywhere;}
-  .grp input{flex:0 0 18px;width:18px;height:18px;margin:0;}
-  strong{color:var(--gold-light)}
-  p[role=status]{padding:10px 12px;background:rgba(227,176,75,.07);border:1px solid var(--line);border-radius:10px;}
-  @media(max-width:600px){body{padding:22px 13px 40px;font-size:14px;}h1{font-size:25px}section{padding:17px;border-radius:15px;margin:12px 0;}h2{font-size:17px}button{max-width:100%}.grps{grid-template-columns:1fr}}
-</style>
+          s=out.join('\\n');}
+        t.value=(t.value?t.value+'\\n':'')+s;count();};r.readAsText(file);});
+    })();
+    </script>`}
+  </section>
 
-  <h1>ABSOLUTE DATA · WhatsApp Bot</h1><p>Estado: <b>${esc(connection)}</b></p>${errorPanel}${reconnectPanel}<section><h2>Conectar número</h2>${qr}</section>${pairingPanel}
-  <form method="post" action="/save"><section><h2>Grupos administrados (${config.groupJids.length})</h2><p><small>Marca los grupos donde el bot enviará avisos y moderará. Si un grupo no aparece, conecta WhatsApp y actualiza la página.</small></p><div class="grps">${groups}</div>
-  <label>Intervalo de mensajes (minutos)</label><input name="intervalMinutes" type="number" min="1" value="${config.intervalMinutes}">
-  <label>Mensaje automático</label><textarea name="scheduledMessage" rows="3">${esc(config.scheduledMessage)}</textarea></section>
-  <section><h2>Moderación</h2><label>Palabras prohibidas (separadas por coma)</label><input name="blockedWords" value="${esc(config.blockedWords.join(', '))}">
-  <label><input style="width:auto" type="checkbox" name="blockLinks" ${config.blockLinks?'checked':''}> Bloquear enlaces</label>
-  <label>Máximo de mensajes por ventana</label><input name="maxMessagesPerWindow" type="number" min="2" value="${config.maxMessagesPerWindow}">
-  <label>Ventana en segundos</label><input name="windowSeconds" type="number" min="1" value="${config.windowSeconds}">
-  <label>Advertencias antes de expulsar</label><input name="warningsBeforeKick" type="number" min="0" value="${config.warningsBeforeKick}">
-  <label>Números administradores protegidos (con código de país, separados por coma)</label><input name="adminNumbers" value="${esc(config.adminNumbers.join(', '))}">
-  <label><input style="width:auto" type="checkbox" name="binCommandEnabled" ${config.binCommandEnabled?'checked':''}> Comando .bin activo (ej. “.bin 457173”: banco, marca, tipo y país)</label>
-  <label><input style="width:auto" type="checkbox" name="enabled" ${config.enabled?'checked':''}> Bot activo</label><button>Guardar configuración</button></section></form>
-  ${broadcastPanel}${profilePanel}${changeNumberPanel}
-  <section><h2>Actividad reciente</h2><div class="log">${esc(logs.join('\n')) || 'Sin actividad todavía.'}</div></section>
-  <p><small>El bot debe permanecer conectado y ser administrador del grupo para borrar mensajes y expulsar miembros.</small></p></html>`);
-});
-app.post('/save', (req, res) => {
-  config.groupJids = [].concat(req.body.groupJids || []).map(String).filter(id => id.endsWith('@g.us'));
-  config.intervalMinutes = Math.max(1, Number(req.body.intervalMinutes) || 60);
-  config.scheduledMessage = req.body.scheduledMessage || '';
-  config.blockedWords = (req.body.blockedWords || '').split(',').map(x=>x.trim()).filter(Boolean);
-  config.blockLinks = req.body.blockLinks === 'on';
-  config.maxMessagesPerWindow = Math.max(2, Number(req.body.maxMessagesPerWindow) || 6);
-  config.windowSeconds = Math.max(1, Number(req.body.windowSeconds) || 10);
-  config.warningsBeforeKick = Math.max(0, Number(req.body.warningsBeforeKick) || 0);
-  config.adminNumbers = (req.body.adminNumbers || '').split(',').map(x=>digits(x.trim())).filter(Boolean);
-  config.enabled = req.body.enabled === 'on';
-  config.binCommandEnabled = req.body.binCommandEnabled === 'on';
-  save(); log('Configuración guardada.'); res.redirect('/');
-});
-app.post('/broadcast/start', (req, res) => {
-  if (['running', 'paused'].includes(broadcast.status)) return res.redirect('/');
-  config.defaultCountryCode = digits(req.body.defaultCountryCode) || '52';
-  config.broadcastMessage = String(req.body.broadcastMessage || '').trim() || config.broadcastMessage;
-  config.broadcastDailyLimit = Math.max(1, Number(req.body.broadcastDailyLimit) || 150);
-  config.broadcastMinDelaySec = Math.max(5, Number(req.body.broadcastMinDelaySec) || 20);
-  config.broadcastMaxDelaySec = Math.max(config.broadcastMinDelaySec, Number(req.body.broadcastMaxDelaySec) || 45);
-  save();
-  const { contacts, invalid } = parseContacts(String(req.body.contacts || ''), config.defaultCountryCode);
-  const own = digits(sock?.user?.id?.split(':')[0]?.split('@')[0]);
-  const queue = contacts.filter(c => c.number !== own);
-  if (!queue.length) { broadcast.lastError = 'No se encontraron números válidos.'; saveBroadcast(); return res.redirect('/'); }
-  broadcast = { ...emptyBroadcast(), status: 'running', message: config.broadcastMessage, queue, total: queue.length, day: today(),
-    sentToday: broadcast.day === today() ? broadcast.sentToday : 0 };
-  saveBroadcast();
-  log(`Envío a contactos iniciado: ${queue.length} números${invalid ? ` (${invalid} inválidos descartados)` : ''}.`);
-  runBroadcast();
-  res.redirect('/');
-});
-app.post('/broadcast/pause', (req, res) => {
-  if (broadcast.status === 'running') { broadcast.status = 'paused'; saveBroadcast(); log('Envío a contactos en pausa.'); }
-  res.redirect('/');
-});
-app.post('/broadcast/resume', (req, res) => {
-  if (broadcast.status === 'paused') { broadcast.status = 'running'; saveBroadcast(); log('Envío a contactos reanudado.'); runBroadcast(); }
-  res.redirect('/');
-});
-app.post('/broadcast/cancel', (req, res) => {
-  if (['running', 'paused'].includes(broadcast.status)) { broadcast.status = 'cancelled'; broadcast.queue = []; saveBroadcast(); log('Envío a contactos cancelado.'); }
-  res.redirect('/');
-});
-app.post('/profile-status', async (req, res) => {
-  config.profileStatus = String(req.body.profileStatus || '').trim().slice(0, 139);
-  save();
-  await applyProfileStatus();
-  res.redirect('/');
-});
-app.post('/reset-session', async (req, res) => {
-  console.warn('[Baileys] Session reset requested from the panel.');
-  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-  const old = sock;
-  sock = null; // los eventos del socket viejo se ignoran a partir de aquí
-  if (old) {
-    try { await old.logout(); } catch {}
-    try { old.end(undefined); } catch {}
-  }
-  try { fs.rmSync(AUTH, { recursive: true, force: true }); } catch (e) { log('No se pudo borrar la sesión: ' + e.message); }
-  connection = 'Desconectado'; sessionRegistered = false; qrDataUrl = '';
-  pairingCode = ''; pairingCodeIssued = false; pairingRequestInProgress = false; pairingStatus = '';
-  lastErrorCode = null; lastErrorMessage = ''; manualReconnectStatus = ''; groupList = [];
-  lastConnectAttemptAt = 0; lastPairingAttemptAt = 0;
-  log('Sesión borrada. Escanea el QR nuevo o usa “Vincular por número” con el número nuevo.');
-  for (let i = 0; i < 20 && connectInProgress; i++) await sleep(500);
-  await sleep(1500);
-  connect().catch(e => log('Error al iniciar: ' + e.message));
-  res.redirect('/');
-});
-app.post('/reconnect-now', (req, res) => {
-  if (sock || connectInProgress) {
-    manualReconnectStatus = 'Ya hay una conexión o un intento en curso.';
-    return res.redirect('/');
-  }
+  <section><h2>Descripción del perfil</h2>
+    <form method="post" action="/s/${s.id}/profile"><label>“Info” del número (máx. 139 caracteres)</label>
+    <input name="profileStatus" maxlength="139" value="${esc(c.profileStatus)}"><button>Guardar y aplicar</button></form>
+  </section>
 
-  const remaining = MANUAL_RECONNECT_COOLDOWN_MS - (Date.now() - lastManualReconnectAt);
-  if (lastManualReconnectAt && remaining > 0) {
-    manualReconnectStatus = `Espera ${Math.ceil(remaining / 60000)} minutos antes de otro intento manual.`;
-    return res.redirect('/');
-  }
+  <section><h2>Actividad reciente</h2><div class="log">${esc(s.logs.join('\n')) || 'Sin actividad todavía.'}</div></section>
 
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-  }
-  lastManualReconnectAt = Date.now();
-  manualReconnectStatus = 'Intento manual iniciado.';
-  pairingStatus = '';
-  connection = 'Reconectando';
-  console.info('[Baileys] Manual reconnect requested from the panel.');
-  connect({ manual: true });
+  <section><h2>Eliminar número</h2>
+    <p><small>Desvincula el número y borra su configuración del bot. No se puede deshacer.</small></p>
+    <form method="post" action="/s/${s.id}/delete" onsubmit="return confirm('¿Eliminar ${esc(s.label).replace(/'/g, '')} del bot? No se puede deshacer.')"><button class="danger">Eliminar número</button></form>
+  </section>`, waiting ? 20 : 0));
+});
+
+app.post('/s/:id/connect', (req, res) => { const s = get(req, res); if (!s) return; s.stopped = false; s.retries = 0; s.connect(); setTimeout(() => res.redirect('/s/' + s.id), 2500); });
+app.post('/s/:id/pairing', async (req, res) => {
+  const s = get(req, res); if (!s) return;
+  const phone = digits(req.body.phone);
+  if (!/^\d{8,15}$/.test(phone)) { s.log('Número inválido para el código: usa de 8 a 15 dígitos con código de país.'); return res.redirect('/s/' + s.id); }
+  try { await s.requestPairingCode(phone); s.log('Código de vinculación generado.'); }
+  catch (e) { s.log('No se pudo generar el código: ' + e.message); }
+  res.redirect('/s/' + s.id);
+});
+app.post('/s/:id/reset', async (req, res) => { const s = get(req, res); if (!s) return; await s.resetSession(); setTimeout(() => res.redirect('/s/' + s.id), 2000); });
+
+app.post('/s/:id/save', (req, res) => {
+  const s = get(req, res); if (!s) return;
+  const c = s.config, b = req.body;
+  c.groupJids = [].concat(b.groupJids || []).map(String).filter(id => id.endsWith('@g.us'));
+  c.intervalMinutes = Math.max(1, Number(b.intervalMinutes) || 60);
+  c.scheduledMessage = String(b.scheduledMessage || '');
+  c.blockedWords = String(b.blockedWords || '').split(',').map(x => x.trim()).filter(Boolean);
+  c.blockLinks = b.blockLinks === 'on';
+  c.maxMessagesPerWindow = Math.max(2, Number(b.maxMessagesPerWindow) || 6);
+  c.windowSeconds = Math.max(1, Number(b.windowSeconds) || 10);
+  c.warningsBeforeKick = Math.max(0, Number(b.warningsBeforeKick) || 0);
+  c.adminNumbers = String(b.adminNumbers || '').split(',').map(x => digits(x)).filter(Boolean);
+  c.enabled = b.enabled === 'on';
+  s.save(); s.log('Configuración guardada.');
+  res.redirect('/s/' + s.id);
+});
+
+app.post('/s/:id/rental', (req, res) => {
+  const s = get(req, res); if (!s) return;
+  const c = s.config;
+  c.name = String(req.body.name || '').trim().slice(0, 40) || c.name;
+  c.client = String(req.body.client || '').trim().slice(0, 60);
+  c.notes = String(req.body.notes || '').trim().slice(0, 300);
+  c.expiresAt = fromInputDate(req.body.expiresAt);
+  if (!s.expired) c.expiredNotified = false;
+  s.save(); s.log(`Renta actualizada. Vence: ${fmtDate(c.expiresAt)}.`);
+  res.redirect('/s/' + s.id);
+});
+app.post('/s/:id/extend', (req, res) => {
+  const s = get(req, res); if (!s) return;
+  s.extend(Math.max(1, Math.min(366, Number(req.body.days) || 30)));
+  s.config.expiredNotified = false; s.save();
+  res.redirect('/s/' + s.id);
+});
+app.post('/s/:id/toggle', (req, res) => {
+  const s = get(req, res); if (!s) return;
+  s.config.active = !s.config.active; s.save();
+  s.log(s.config.active ? 'Número reactivado.' : 'Número pausado manualmente.');
+  if (s.config.active) s.runBroadcast();
+  res.redirect('/s/' + s.id);
+});
+
+app.post('/s/:id/broadcast/start', (req, res) => {
+  const s = get(req, res); if (!s) return;
+  const c = s.config, b = req.body;
+  c.defaultCountryCode = digits(b.defaultCountryCode) || '52';
+  c.broadcastMessage = String(b.broadcastMessage || '').trim() || c.broadcastMessage;
+  c.broadcastDailyLimit = Math.max(1, Number(b.broadcastDailyLimit) || 100);
+  c.broadcastMinDelaySec = Math.max(5, Number(b.broadcastMinDelaySec) || 20);
+  c.broadcastMaxDelaySec = Math.max(c.broadcastMinDelaySec, Number(b.broadcastMaxDelaySec) || 45);
+  s.save();
+  s.startBroadcast(b.contacts);
+  res.redirect('/s/' + s.id);
+});
+app.post('/s/:id/broadcast/:status', (req, res) => {
+  const s = get(req, res); if (!s) return;
+  if (['paused', 'running', 'cancelled'].includes(req.params.status)) s.setBroadcastStatus(req.params.status);
+  res.redirect('/s/' + s.id);
+});
+app.post('/s/:id/profile', async (req, res) => {
+  const s = get(req, res); if (!s) return;
+  s.config.profileStatus = String(req.body.profileStatus || '').trim().slice(0, 139); s.save();
+  await s.applyProfileStatus();
+  res.redirect('/s/' + s.id);
+});
+app.post('/s/:id/delete', async (req, res) => {
+  const s = get(req, res); if (!s) return;
+  s.stopped = true;
+  const sock = s.sock; s.sock = null;
+  if (sock) { try { await sock.logout(); } catch {} try { sock.end(undefined); } catch {} }
+  await s.stop();
+  sessions.delete(s.id);
+  fs.rmSync(s.dir, { recursive: true, force: true });
+  console.info(`[${s.label}] Número eliminado del bot.`);
   res.redirect('/');
 });
-app.post('/pairing-code', async (req, res) => {
-  if (sessionRegistered) {
-    pairingCode = '';
-    pairingStatus = '';
-    return res.redirect('/');
-  }
 
-  const phoneNumber = String(req.body.phoneNumber || '').trim();
-  if (!/^\d{8,15}$/.test(phoneNumber)) {
-    pairingStatus = 'Escribe entre 8 y 15 dígitos, incluido el código de país, sin +.';
-    return res.redirect('/');
-  }
-  if (!sock || connection !== 'Escanea el QR') {
-    pairingStatus = 'Espera a que la conexión esté lista para generar el código.';
-    return res.redirect('/');
-  }
-
-  const remaining = RETRY_INTERVAL_MS - (Date.now() - lastPairingAttemptAt);
-  if (lastPairingAttemptAt && remaining > 0) {
-    pairingStatus = `Espera ${Math.ceil(remaining / 1000)} segundos antes de solicitar otro código.`;
-    return res.redirect('/');
-  }
-
-  const activeSocket = sock;
-  const maskedPhoneNumber = maskPhoneNumber(phoneNumber);
-  console.info(`[Baileys] Pairing request received for ${maskedPhoneNumber}.`);
-  lastPairingAttemptAt = Date.now();
-  pairingRequestInProgress = true;
-  pairingCode = '';
-  pairingStatus = '';
-  try {
-    const code = String(await activeSocket.requestPairingCode(phoneNumber)).toUpperCase();
-    pairingCodeIssued = Boolean(code);
-    console.info(`[Baileys] Pairing code generated for ${maskedPhoneNumber} (${code.length} characters; value omitted from logs).`);
-    if (sock !== activeSocket || sessionRegistered) {
-      pairingStatus = 'La sesión cambió mientras se generaba el código. Actualiza el panel.';
-      if (sessionRegistered) pairingCodeIssued = false;
-    } else if (!/^[A-Z0-9]{8}$/.test(code)) {
-      pairingStatus = 'Baileys devolvió un código con formato inesperado.';
-    } else {
-      pairingCode = code;
-      pairingStatus = 'Código generado. Escríbelo en WhatsApp para completar la vinculación.';
-      console.info('[Baileys] Existing socket kept; pairing code generation did not restart it.');
-    }
-  } catch (e) {
-    pairingStatus = 'No se pudo generar el código. Comprueba la conexión e inténtalo más tarde.';
-    const details = rememberError(e);
-    console.error(`[Baileys] Pairing code failed for ${maskedPhoneNumber}:`, details);
-    log('Error al generar el código de vinculación: ' + e.message);
-    if (!sock && !pairingCodeIssued) scheduleReconnect(details?.code);
-  } finally {
-    pairingRequestInProgress = false;
-  }
-  res.redirect('/');
-});
-app.get('/api/status', (req,res)=>res.json({connection, groups:groupList.map(g=>({id:g.id,name:g.subject})), config}));
-app.listen(PORT, '0.0.0.0', () => console.log(`Panel disponible en puerto ${PORT}`));
-connect().catch(e => { console.error(e); log('Error al iniciar: '+e.message); });
+app.listen(PORT, '0.0.0.0', () => console.log(`Panel disponible en puerto ${PORT} · ${sessions.size} número(s)`));
