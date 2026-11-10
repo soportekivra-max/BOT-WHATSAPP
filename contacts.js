@@ -61,3 +61,4 @@ function fillTemplate(message, name) {
 }
 
 module.exports = { parseContacts, normalizeNumber, fillTemplate };
+
