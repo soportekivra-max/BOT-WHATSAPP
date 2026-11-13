@@ -8,6 +8,7 @@ const {
   default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers
 } = require('@whiskeysockets/baileys');
 const { parseContacts, fillTemplate } = require('./contacts');
+const { handleBinCommand } = require('./bin');
 
 const DAY = 24 * 60 * 60 * 1000;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -26,7 +27,7 @@ const DEFAULTS = {
   groupJids: [], intervalMinutes: 60,
   scheduledMessage: '📢 Aviso del grupo: mantengamos el orden y respetemos las reglas.',
   enabled: true, blockedWords: [], blockLinks: true, maxMessagesPerWindow: 6, windowSeconds: 10,
-  warningsBeforeKick: 1, adminNumbers: [], profileStatus: '',
+  warningsBeforeKick: 1, adminNumbers: [], profileStatus: '', binCommandEnabled: true,
   defaultCountryCode: '52', broadcastMessage: 'Hola {nombre} 👋',
   broadcastDailyLimit: 100, broadcastMinDelaySec: 20, broadcastMaxDelaySec: 45
 };
@@ -117,7 +118,10 @@ class Session {
       socket.ev.on('group-participants.update', () => this.refreshGroups());
       socket.ev.on('messages.upsert', async ({ messages, type }) => {
         if (this.sock !== socket || type !== 'notify') return;
-        for (const m of messages) await this.moderate(m).catch(e => this.log('Error de moderación: ' + e.message));
+        for (const m of messages) {
+          await this.handleBin(m).catch(e => this.log('Error en .bin: ' + e.message));
+          await this.moderate(m).catch(e => this.log('Error de moderación: ' + e.message));
+        }
       });
     } catch (e) {
       if (socket && this.sock === socket) this.sock = null;
@@ -215,6 +219,20 @@ class Session {
         this.log(`Advertencia a ${sender.split('@')[0]}: ${reason}`);
       }
     } catch (e) { this.log('Error de moderación. ¿El bot es administrador del grupo? ' + e.message); }
+  }
+
+  // ---- comando .bin (info pública de los primeros 6-8 dígitos) ----
+  async handleBin(m) {
+    const jid = m.key.remoteJid;
+    const text = this.getText(m);
+    if (!jid || !/^\s*[.!/]bin\b/i.test(text)) return;
+    if (!this.rentalOk || !this.config.binCommandEnabled) return;
+    if (jid.endsWith('@g.us') && !this.isManagedGroup(jid)) return;
+    if (!jid.endsWith('@g.us') && !/@(s\.whatsapp\.net|lid)$/.test(jid)) return; // ignora estados y canales
+    const reply = await handleBinCommand(text, m.key.participant || jid);
+    if (!reply || !this.isConnected) return;
+    await this.sock.sendMessage(jid, { text: reply }, { quoted: m });
+    this.log('Respondí .bin en ' + (this.groupList.find(g => g.id === jid)?.subject || jid.split('@')[0]) + '.');
   }
 
   // ---- avisos programados (lo llama un reloj global cada minuto) ----
