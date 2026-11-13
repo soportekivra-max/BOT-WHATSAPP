@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { Session, DAY } = require('./session');
+const { initBinCache } = require('./bin');
 
 // ---- Configuración (variables de entorno en Render) ----
 // ADMIN_PASSWORD  contraseña del panel (usuario: admin)
@@ -13,6 +14,7 @@ if (!process.env.ADMIN_PASSWORD && !process.env.PANEL_PASSWORD) console.log('Con
 const DATA_DIR = process.env.DATA_DIR || (fs.existsSync('/var/data') ? '/var/data' : __dirname);
 const SESS_DIR = path.join(DATA_DIR, 'sessions');
 fs.mkdirSync(SESS_DIR, { recursive: true });
+initBinCache(DATA_DIR);
 
 const app = express();
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
@@ -237,6 +239,7 @@ app.get('/s/:id', (req, res) => {
     <label>Advertencias antes de expulsar</label><input name="warningsBeforeKick" type="number" min="0" value="${c.warningsBeforeKick}">
     <label>Números protegidos (con código de país, separados por coma)</label><input name="adminNumbers" value="${esc(c.adminNumbers.join(', '))}">
     <label class="chk"><input type="checkbox" name="enabled" ${c.enabled ? 'checked' : ''}> Avisos y moderación activos</label>
+    <label class="chk"><input type="checkbox" name="binCommandEnabled" ${c.binCommandEnabled ? 'checked' : ''}> Comando .bin activo (ej. “.bin 457173”: banco, marca, tipo y país)</label>
     <button>Guardar configuración</button>
   </section>
   </form>
@@ -311,6 +314,7 @@ app.post('/s/:id/save', (req, res) => {
   c.warningsBeforeKick = Math.max(0, Number(b.warningsBeforeKick) || 0);
   c.adminNumbers = String(b.adminNumbers || '').split(',').map(x => digits(x)).filter(Boolean);
   c.enabled = b.enabled === 'on';
+  c.binCommandEnabled = b.binCommandEnabled === 'on';
   s.save(); s.log('Configuración guardada.');
   res.redirect('/s/' + s.id);
 });
